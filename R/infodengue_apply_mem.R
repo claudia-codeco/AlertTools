@@ -1,6 +1,169 @@
 # Function to apply MEM algorithm to generate pre-epidemic, post-epidemic, and high activity thresholds
 # to municipalities covered by InfoDengue project
-#' 
+
+# calc_mem-------------------------------------------------------------------------------
+#' @description uses MEM package to generate activity thresholds.
+#' Apply MEM algorithm discarding seasons below local pre-epidemic threshold.
+#' For each municipality, pre-epidemic (limiar_preseason) threshold has a minimum set at 5 cases.
+#' If calculated value falls below that, it is set to 5, with high activity (limiar_epidemico) set 
+#' to either the 90% quantile or 10, whichever is the greatest. The thresholds are given both in number of cases or
+#' as incidence. The alert model uses incidence.
+#' @title calc_mem
+#' @export
+#' @param start_year Historical data starting year to consider. Default: 0 (i.e., as old as possible)
+#' @param end_year Historical data final year to consider. Default: previous year from Sys.Date()
+#' @param data Data.frame with columns: gecocode, SE, cases, pop. Can be obtained from the API.  
+#' @param i.n.max Number of points by seasons to be used for pre-epidemic and epidemic regions to calculate each threshold.
+#'    If 0 (default), uses all points in those regions. Else, uses n max values in each region per season.
+#'    This value is passed to i.n.max parameter in \code{memmodel}, from MEM package.
+#' @param limiar.preseason Level of confidence interval to calculate pre/post-season thresholds. Default: 0.9.
+#'    This value is passed to i.level.threshold parameter in \code{memmodel}, from MEM package.
+#' @param limiar.epidemico Level of confidence interval to calculate high activity during epidemic region. Default: 0.95.
+#'    This value is passed to i.level.intensity parameter in \code{memmodel}, from MEM package.
+#' @param mincases.pre minimum number of cases to launch a preseason alert. Default: 5
+#' @param mincases.epi minimum number of cases to launch an epidemic alert. Default: 10
+#' @param ... Optional arguments passed to \code{memmodel}, from MEM package.
+#' @return List with thresholds calculated by mem,  by simple percentile and the choice used in the infodengue model, by municipality: 
+#'  \describe{
+#'  \item{mem: threshold values calculated by mem}{municipio_geocodigo = geocode, inc_preseason = preseason incidence threshold, inc_posseason = 
+#'  pos-season incidence threshold, inc_epidemico = high incidence threshold, inicio and inicio.ic = estimated begining of the season
+#'  duracao, duracao.ic = season duration. ano_inicio and ano_fim used for calculation.} 
+#'  \item{percentiles: threshold values calculated as percentiles (incidence)}{quant_pre = preseason incidence threshold,
+#'  quant_pos = posseason incidence threshold, quant_epidemico = epidemic incidence threshold.} 
+#'  \item{min_threshold_inc:}{pre-defined minimum threshold.} 
+#'  \item{threshold: values used by Infodengue}{MEM's values if cases > min.cases, percentiles otherwise: limiar_preseason, limiar_posseason, 
+#'  limiar_epidemico.}    
+#'    }
+#' @examples
+#' Generate thresholds for Rio de Janeiro, Curitiba and Vitoria, using the whole history. 
+#' Get data from API:
+#' url <- "https://info.dengue.mat.br/api/alertcity?"; geocode <- 3205309
+#' disease <- "dengue"; format <- "csv"; ey_end <- 2019
+#' cons1 <- paste0(url,"geocode=",geocode,"&disease=",disease,"&format=csv&ew_start=1&ew_end=52",
+#'                "&ey_start=2010","&ey_end=",ey_end)
+#' dados <- read_csv(cons1); dados$municipio_geocodigo <- 3205309 
+#' thres <- calc_mem(dados)
+#' thres
+#' Using server connection (NOT RUN)
+#' dados <- getCases(cities = c4314902)
+#' dados <- dados %>% rename(municipio_geocodigo = cidade)
+#' thres <- calc_mem(dados)
+#' More than one city:
+#' cidades <- getCidades(uf = "Ceará")
+#' dados <- getCases(cities = cidades$municipio_geocodigo)
+#' dados <- dados %>% rename(municipio_geocodigo = cidade)
+#' thres <- calc_mem(dados)
+
+calc_mem <- function(d, start_year=2010, end_year=as.integer(format(Sys.Date(), '%Y'))-1,
+                                 i.n.max=0, limiar.preseason=0.95, limiar.epidemico=0.95, i.type.curve=2,
+                                 i.type.threshold=2, i.type.intensity=2, mincases.pre = 5, mincases.pos = 5,
+                                 mincases.epi=10, ...){
+  
+  require(mem, quietly=TRUE, warn.conflicts=FALSE)
+  #require(plyr, quietly=TRUE, warn.conflicts=FALSE)
+  require(data.table, quietly=TRUE, warn.conflicts=FALSE)
+  
+  # check input data
+  assert_that(all(c("municipio_geocodigo", "pop","casos","SE") %in% names(d)), 
+              msg = "d must contain municipio_geocodigo, pop, casos, SE")
+  
+  # filter period
+  d <- d %>% 
+   filter(SE > start_year*100 & SE <= end_year*100+52) 
+  
+  effec_start_year <- min(round(d$SE/100))
+  
+  # nmun
+  mun <- unique(d$municipio_geocodigo)
+  nmun <- length(mun)
+  
+  # Process data in chuncks for 300 municipalities at a time:
+  mun_list <- split(mun, ceiling(seq_along(mun)/20))
+  
+  # Prepare output data table
+  #thresholds.table <-   data.table('municipio_geocodigo'=integer(), 'ano_inicio'=integer(), 'ano_fim'=integer(),
+  #                                 'pre'=double(), 'pos'=double(), 'muitoalta'=double())
+  thresholds.table <-   data.table(NULL)
+  
+  # Run by chuncks:
+  for (mun_chunck in mun_list){
+    print(mun_chunck)
+    
+    df <- d %>%
+         filter(municipio_geocodigo %in% mun_chunck) 
+    
+    # pop
+    df.pop <- df %>%
+      group_by(municipio_geocodigo) %>%
+      summarise(pop = mean(pop, na.rm = TRUE))
+    
+    # calc incidence
+    df$inc <- df$casos * 100000 / df$pop
+    
+    # Store only necessary data, separating seasons by columns (epiYear: cut at week 40)
+    dfsimple <- df[df$SE > max(df$SE[df$SE<(effec_start_year+1)*100])-12 &
+                         df$SE < (effec_start_year+1)*100+41, c('municipio_geocodigo', 'SE', 'inc')]
+    effec_start_year_lbl <- paste0(effec_start_year,'-',effec_start_year+1)
+    dfsimple <- plyr::rename(dfsimple, c('SE'=paste0('SE',effec_start_year_lbl), 'inc'=effec_start_year_lbl))
+    seasons <- c(effec_start_year_lbl)
+    for (i in (effec_start_year+1):end_year){
+      if (max(df$SE) >= (i+1)*100 + 41){
+        dfsimple <- bindseason(df, dfsimple, i)
+        seasons <- cbind(seasons, paste0(i,'-',i+1))
+      }
+    }
+    
+    # Apply quantile method (new)
+    quantile.tab <- df %>% #inc
+      group_by(municipio_geocodigo) %>%
+      summarise(quant_pre = max(mincases.pre, quantile(casos, probs = 0.10))/mean(pop)*1e5,
+                quant_pos = max(mincases.pre,quantile(casos, probs = 0.10))/mean(pop)*1e5,
+                quant_epidemico = max(mincases.epi,quantile(casos, probs = limiar.epidemico))/mean(pop)*1e5)
+    
+    # Apply mem method
+    thresholds.tab <- data.table(municipio_geocodigo=mun_chunck)
+    base.cols <- c('municipio_geocodigo', 'pre', 'pos', 'veryhigh')
+    thresholds <- applymem(dfsimple, seasons, i.n.max=i.n.max, i.level.threshold=limiar.preseason,  #inc
+                           i.level.intensity=limiar.epidemico,
+                           i.type.curve=i.type.curve, i.type.threshold=i.type.threshold,
+                           i.type.intensity=i.type.intensity)$dfthresholds#[base.cols]
+    thresholds.tab <- merge(thresholds.tab, thresholds, by='municipio_geocodigo', all=TRUE) %>% # mem calcula limiar em incidencia
+      left_join(df.pop)  
+    thresholds.tab <- merge(thresholds.tab, quantile.tab, by='municipio_geocodigo', all.x = TRUE) # agrega pop para calcular casos
+    
+    # deciding btw mem and min
+    thresholds.tab <- thresholds.tab %>%
+        mutate(mininc_pre = mincases.pre/pop*1e5,
+             mininc_pos = mincases.pos/pop*1e5,
+             mininc_epi = mincases.epi/pop*1e5,
+             limiar_preseason = case_when(pre > mininc_pre ~ pre, TRUE ~ quant_pre),
+             limiar_posseason = case_when(pos > mininc_pos ~ pos, TRUE ~ quant_pos),
+             limiar_epidemico = case_when(veryhigh > mininc_epi ~ veryhigh, TRUE ~ quant_epidemico)) %>%
+      rename(inc_preseason = pre,
+             inc_posseason = pos,
+             inc_epidemico = veryhigh)
+    
+    thresholds.tab$ano_inicio <- start_year
+    thresholds.tab$ano_fim <- end_year
+    #thresholds.tab <- thresholds.tab[, c('municipio_geocodigo', 'ano_inicio', 'ano_fim','pre', 'pos', 'muitoalta')]
+    thresholds.table <- rbindlist(list(thresholds.table, thresholds.tab))
+    
+  }
+  #thresholds.table <- plyr::rename(thresholds.table, replace=c('pre'='limiar_preseason', 'pos'='limiar_posseason',
+  #                                                         'muitoalta'='limiar_epidemico'))
+  
+  obj <- list(mem = thresholds.table[,c('municipio_geocodigo','inc_preseason','inc_posseason','inc_epidemico','inicio',
+                                        'inicio.ic','duracao','duracao.ic')],
+              percentiles = thresholds.table[,c('municipio_geocodigo','quant_pre','quant_pos','quant_epidemico')],
+              min_threshold_inc = thresholds.table[,c('municipio_geocodigo','pop','mininc_pre','mininc_pos','mininc_epi')],
+              thresholds = thresholds.table[,c('municipio_geocodigo','limiar_preseason','limiar_posseason',
+                                               'limiar_epidemico','ano_inicio','ano_fim')])
+  class(obj) <- "infomem"
+  return(obj)
+}
+  
+
+
 #' Function \code{infodengue_apply_mem} uses MEM package to generate activity thresholds.
 #' Apply MEM algorithm discarding seasons below local pre-epidemic threshold.
 #' For each municipality, pre-epidemic (limiar_preseason) threshold has a minimum set at 5 cases.
